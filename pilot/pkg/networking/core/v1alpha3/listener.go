@@ -91,8 +91,17 @@ var (
 	// These are sniffed by the HTTP Inspector in the outbound listener
 	// We need to forward these ALPNs to upstream so that the upstream can
 	// properly use a HTTP or TCP listener
-	plaintextHTTPALPNs = []string{"http/1.0", "http/1.1", "h2c"}
-	mtlsHTTPALPNs      = []string{"istio-http/1.0", "istio-http/1.1", "istio-h2"}
+	plaintextHTTPALPNs = func() []string {
+		if features.HTTP10 {
+			// If HTTP 1.0 is enabled, we will match it
+			return []string{"http/1.0", "http/1.1", "h2c"}
+		}
+		// Otherwise, matching would just lead to immediate rejection. By not matching, we can let it pass
+		// through as raw TCP at least.
+		// NOTE: mtlsHTTPALPNs can always include 1.0, for simplicity, as it will only be sent if a client
+		return []string{"http/1.1", "h2c"}
+	}()
+	mtlsHTTPALPNs = []string{"istio-http/1.0", "istio-http/1.1", "istio-h2"}
 
 	allIstioMtlsALPNs = []string{"istio", "istio-peer-exchange", "istio-http/1.0", "istio-http/1.1", "istio-h2"}
 
@@ -1302,10 +1311,8 @@ func buildHTTPConnectionManager(listenerOpts buildListenerOpts, httpOpts *httpLi
 
 	routerFilterCtx := configureTracing(listenerOpts, connectionManager)
 
-	// Add fault filter at the top.
-	filters := make([]*hcm.HttpFilter, len(httpFilters)+1)
-	filters[0] = xdsfilters.Fault
-	copy(filters[1:], httpFilters)
+	filters := make([]*hcm.HttpFilter, len(httpFilters))
+	copy(filters, httpFilters)
 
 	if features.MetadataExchange {
 		filters = append(filters, xdsfilters.HTTPMx)
@@ -1324,7 +1331,8 @@ func buildHTTPConnectionManager(listenerOpts buildListenerOpts, httpOpts *httpLi
 		filters = append(filters, xdsfilters.Alpn)
 	}
 
-	filters = append(filters, xdsfilters.Cors)
+	// TypedPerFilterConfig in route needs these filters.
+	filters = append(filters, xdsfilters.Fault, xdsfilters.Cors)
 	filters = append(filters, listenerOpts.push.Telemetry.HTTPFilters(listenerOpts.proxy, listenerOpts.class)...)
 	filters = append(filters, xdsfilters.BuildRouterFilter(routerFilterCtx))
 

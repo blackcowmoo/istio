@@ -80,6 +80,7 @@ import (
 	istioclient "istio.io/client-go/pkg/clientset/versioned"
 	istiofake "istio.io/client-go/pkg/clientset/versioned/fake"
 	istioinformer "istio.io/client-go/pkg/informers/externalversions"
+	"istio.io/istio/operator/pkg/apis"
 	"istio.io/istio/pkg/kube/mcs"
 	"istio.io/istio/pkg/queue"
 	"istio.io/pkg/version"
@@ -323,7 +324,8 @@ type client struct {
 	fastSync               bool
 	informerWatchesPending *atomic.Int32
 
-	mirrorQueue queue.Instance
+	mirrorQueue        queue.Instance
+	mirrorQueueStarted atomic.Bool
 
 	// These may be set only when creating an extended client.
 	revision        string
@@ -333,7 +335,6 @@ type client struct {
 
 	versionOnce sync.Once
 	version     *kubeVersion.Info
-	versionErr  error
 }
 
 // newClientInternal creates a Kubernetes client from the given factory.
@@ -466,7 +467,8 @@ func (c *client) GatewayAPIInformer() gatewayapiinformer.SharedInformerFactory {
 // RunAndWait starts all informers and waits for their caches to sync.
 // Warning: this must be called AFTER .Informer() is called, which will register the informer.
 func (c *client) RunAndWait(stop <-chan struct{}) {
-	if c.mirrorQueue != nil {
+	if c.mirrorQueue != nil && !c.mirrorQueueStarted.Load() {
+		c.mirrorQueueStarted.Store(true)
 		go c.mirrorQueue.Run(stop)
 	}
 	c.kubeInformer.Start(stop)
@@ -506,10 +508,19 @@ func (c *client) RunAndWait(stop <-chan struct{}) {
 func (c *client) GetKubernetesVersion() (*kubeVersion.Info, error) {
 	c.versionOnce.Do(func() {
 		v, err := c.Discovery().ServerVersion()
-		c.version = v
-		c.versionErr = err
+		if err == nil {
+			c.version = v
+		}
 	})
-	return c.version, c.versionErr
+	if c.version != nil {
+		return c.version, nil
+	}
+	// Initial attempt failed, retry on each call to this function
+	v, err := c.Discovery().ServerVersion()
+	if err != nil {
+		c.version = v
+	}
+	return c.version, err
 }
 
 type reflectInformerSync interface {
@@ -789,16 +800,7 @@ func (c *client) GetIstioVersions(ctx context.Context, namespace string) (*versi
 			continue
 		}
 		if len(result) > 0 {
-			versionParts := strings.Split(string(result), "-")
-			nParts := len(versionParts)
-			if nParts >= 3 {
-				server.Info.Version = strings.Join(versionParts[0:nParts-2], "-")
-				server.Info.GitTag = server.Info.Version
-				server.Info.GitRevision = versionParts[nParts-2]
-				server.Info.BuildStatus = versionParts[nParts-1]
-			} else {
-				server.Info.Version = string(result)
-			}
+			setServerInfoWithIstiodVersionInfo(&server.Info, string(result))
 			// (Golang version not available through :15014/version endpoint)
 
 			res = append(res, server)
@@ -895,7 +897,14 @@ func (c *client) UtilFactory() util.Factory {
 func (c *client) applyYAMLFile(namespace string, dryRun bool, file string) error {
 	// Create the options.
 	streams, _, stdout, stderr := genericclioptions.NewTestIOStreams()
-	opts := apply.NewApplyOptions(streams)
+	flags := apply.NewApplyFlags(c.clientFactory, streams)
+	flags.DeleteFlags.FileNameFlags.Filenames = &[]string{file}
+
+	cmd := apply.NewCmdApply("", c.clientFactory, streams)
+	opts, err := flags.ToOptions(cmd, "", nil)
+	if err != nil {
+		return err
+	}
 	opts.DynamicClient = c.dynamic
 	opts.DryRunVerifier = resource.NewDryRunVerifier(c.dynamic, c.discoveryClient)
 	opts.FieldManager = fieldManager
@@ -921,16 +930,14 @@ func (c *client) applyYAMLFile(namespace string, dryRun bool, file string) error
 		}
 	}
 
-	opts.DeleteFlags.FileNameFlags.Filenames = &[]string{file}
 	opts.DeleteOptions = &kubectlDelete.DeleteOptions{
 		DynamicClient:   c.dynamic,
 		IOStreams:       streams,
-		FilenameOptions: opts.DeleteFlags.FileNameFlags.ToOptions(),
+		FilenameOptions: flags.DeleteFlags.FileNameFlags.ToOptions(),
 	}
 
 	opts.OpenAPISchema, _ = c.clientFactory.OpenAPISchema()
 
-	var err error
 	opts.Validator, err = c.clientFactory.Validator(true)
 	if err != nil {
 		return err
@@ -1058,5 +1065,23 @@ var IstioScheme = func() *runtime.Scheme {
 	utilruntime.Must(clienttelemetry.AddToScheme(scheme))
 	utilruntime.Must(clientextensions.AddToScheme(scheme))
 	utilruntime.Must(gatewayapi.AddToScheme(scheme))
+	utilruntime.Must(apis.AddToScheme(scheme))
 	return scheme
 }()
+
+func setServerInfoWithIstiodVersionInfo(serverInfo *version.BuildInfo, istioInfo string) {
+	versionParts := strings.Split(istioInfo, "-")
+	nParts := len(versionParts)
+	if nParts >= 3 {
+		// The format will be like 1.12.0-016bc46f4a5e0ef3fa135b3c5380ab7765467c1a-dirty-Modified
+		// version is '1.12.0'
+		// revision is '016bc46f4a5e0ef3fa135b3c5380ab7765467c1a-dirty'
+		// status is 'Modified'
+		serverInfo.Version = versionParts[0]
+		serverInfo.GitTag = serverInfo.Version
+		serverInfo.GitRevision = strings.Join(versionParts[1:nParts-1], "-")
+		serverInfo.BuildStatus = versionParts[nParts-1]
+	} else {
+		serverInfo.Version = istioInfo
+	}
+}

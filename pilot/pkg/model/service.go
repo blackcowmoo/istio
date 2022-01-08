@@ -259,6 +259,17 @@ const (
 	WorkloadEntryKind
 )
 
+func (k workloadKind) String() string {
+	if k == PodKind {
+		return "Pod"
+	}
+
+	if k == WorkloadEntryKind {
+		return "WorkloadEntry"
+	}
+	return ""
+}
+
 type WorkloadInstance struct {
 	Name      string `json:"name,omitempty"`
 	Namespace string `json:"namespace,omitempty"`
@@ -266,6 +277,8 @@ type WorkloadInstance struct {
 	Kind     workloadKind      `json:"kind"`
 	Endpoint *IstioEndpoint    `json:"endpoint,omitempty"`
 	PortMap  map[string]uint32 `json:"portMap,omitempty"`
+	// Can only be selected by service entry of DNS type.
+	DNSServiceEntryOnly bool `json:"dnsServiceEntryOnly,omitempty"`
 }
 
 // DeepCopy creates a copy of WorkloadInstance.
